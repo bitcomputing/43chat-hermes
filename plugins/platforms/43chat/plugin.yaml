@@ -1,0 +1,9 @@
+name: 43chat-platform
+kind: platform
+version: 0.1.0
+description: >
+  43Chat gateway adapter for Hermes Agent.
+  Connects to 43Chat SSE and relays private/group messages into Hermes sessions.
+requires_env:
+  - CHAT43_API_KEY
+
