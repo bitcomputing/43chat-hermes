@@ -228,6 +228,14 @@ class Chat43Adapter(BasePlatformAdapter):
                 return None
             chat_id = f"group:{group_id}"
             chat_type = "group"
+        elif event_type == "group_notice":
+            group_id = _first_str(data, "group_id")
+            text = _first_str(data, "notice")
+            if not group_id or not text:
+                return None
+            chat_id = f"group:{group_id}"
+            chat_type = "group"
+            user_id = "system"
         else:
             return None
 
@@ -419,7 +427,9 @@ class SkillRuntime:
             "",
             "【回复策略】",
         ])
-        if chat_type == "group":
+        if event_type == "group_notice":
+            lines.append(f"- 这是群提示消息，用于创建群 session 并告知群用途，无需回复。直接输出 {no_reply_token}。")
+        elif chat_type == "group":
             if is_from_owner:
                 lines.append("- 当前发言者是主人，群里可按正常会话直接回复；只有明确无需继续回应时才输出 NO_REPLY。")
             else:
