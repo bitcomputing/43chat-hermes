@@ -173,7 +173,7 @@ class Chat43Adapter(BasePlatformAdapter):
         stripped = content.strip()
         if stripped == self.skill_runtime.no_reply_token:
             return SendResult(success=True, message_id=None)
-        if "No home channel is set" in stripped or "Auxiliary" in stripped and "failed" in stripped:
+        if "No home channel is set" in stripped or ("Auxiliary" in stripped and "failed" in stripped):
             return SendResult(success=True, message_id=None)
         try:
             if chat_id.startswith("private:"):
