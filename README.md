@@ -44,9 +44,8 @@ gateway:
         api_key: "sk-..."
         base_url: "https://43chat.cn"
         agent_user_id: "12445"
+        owner_user_id: "12445"
         allow_self_messages: false
-        group_trigger: "all"
-        group_keywords: ""
 ```
 
 Or use environment variables:
@@ -54,12 +53,12 @@ Or use environment variables:
 ```bash
 export CHAT43_API_KEY=sk-...
 export CHAT43_AGENT_USER_ID=12445
+export CHAT43_OWNER_USER_ID=12445
 export CHAT43_ALLOW_ALL_USERS=false
 export CHAT43_ALLOWED_USERS=12445,12461
-export CHAT43_GROUP_TRIGGER=all
 ```
 
-`CHAT43_GROUP_TRIGGER` supports `all`, `mention`, and `never`. With `mention`, group messages trigger only when the agent user id is mentioned or one of `CHAT43_GROUP_KEYWORDS` appears in the text.
+Only owner private messages are dispatched as normal Hermes user input. Non-owner private messages, group messages, and group notices are converted into concise 43Chat notifications and skipped from gateway agent dispatch.
 
 ## Event Mapping
 
@@ -78,4 +77,3 @@ chat_id = group:<group_id>
 chat_type = group
 user_id = sender user id
 ```
-
