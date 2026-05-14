@@ -84,9 +84,7 @@ class Chat43AdapterSettings:
     api_key: str
     base_url: str = "https://43chat.cn"
     agent_id: str | None = None
-    agent_user_id: str | None = None
-    owner_user_id: str | None = None
-    allow_self_messages: bool = False
+    user_id: str | None = None
     request_timeout_s: float = 30.0
     reconnect_initial_s: float = 3.0
     reconnect_max_s: float = 30.0
@@ -102,9 +100,7 @@ class Chat43AdapterSettings:
             api_key=api_key,
             base_url=os.getenv("CHAT43_BASE_URL") or str(_resolve_env_ref(extra.get("base_url")) or "https://43chat.cn"),
             agent_id=os.getenv("CHAT43_AGENT_ID") or _optional_str(_resolve_env_ref(extra.get("agent_id"))),
-            agent_user_id=os.getenv("CHAT43_AGENT_USER_ID") or _optional_str(_resolve_env_ref(extra.get("agent_user_id"))),
-            owner_user_id=os.getenv("CHAT43_OWNER_USER_ID") or _optional_str(_resolve_env_ref(extra.get("owner_user_id"))),
-            allow_self_messages=_bool_env("CHAT43_ALLOW_SELF_MESSAGES", extra.get("allow_self_messages"), False),
+            user_id=os.getenv("CHAT43_USER_ID") or _optional_str(_resolve_env_ref(extra.get("user_id"))),
             request_timeout_s=float(os.getenv("CHAT43_REQUEST_TIMEOUT_S") or extra.get("request_timeout_s") or 30),
             reconnect_initial_s=float(os.getenv("CHAT43_RECONNECT_INITIAL_S") or extra.get("reconnect_initial_s") or 3),
             reconnect_max_s=float(os.getenv("CHAT43_RECONNECT_MAX_S") or extra.get("reconnect_max_s") or 30),
@@ -132,14 +128,14 @@ class Chat43Adapter(BasePlatformAdapter):
         )
 
     async def connect(self) -> bool:
-        if not self.settings.agent_user_id:
+        if not self.settings.user_id:
             try:
                 profile = await self.api.get_profile()
-                user_id = _first(profile, "user_id", "id", "agent_user_id")
+                user_id = _first(profile, "user_id", "id")
                 if user_id is not None:
-                    object.__setattr__(self.settings, "agent_user_id", str(user_id))
+                    object.__setattr__(self.settings, "user_id", str(user_id))
             except Exception:
-                logger.warning("Could not load 43Chat agent profile; self-message filtering may be weaker")
+                logger.warning("Could not load 43Chat profile; self-message filtering may be weaker")
         self.sse.start(self._handle_43chat_event)
         self._mark_connected()
         return True
@@ -222,7 +218,7 @@ class Chat43Adapter(BasePlatformAdapter):
         if event_type == "private_message":
             user_id = _first_str(data, "from_user_id", "sender_id", "user_id")
             text = _message_text(data)
-            if not user_id or not text or self._is_self_message(user_id):
+            if not user_id or not text:
                 return None
             return _inbound(
                 event_type=event_type,
@@ -236,13 +232,14 @@ class Chat43Adapter(BasePlatformAdapter):
                 text=text,
                 conversation_label=_first_str(data, "from_nickname", "from_user_name", "sender_name", "user_name") or f"user:{user_id}",
                 is_from_owner=self._is_from_owner(data, user_id),
+                is_agent=data.get("is_agent") is True,
             )
 
         if event_type == "group_message":
             user_id = _first_str(data, "from_user_id", "sender_id", "user_id")
             group_id = _first_str(data, "group_id", "chat_id")
             text = _message_text(data)
-            if not user_id or not group_id or not text or self._is_self_message(user_id):
+            if not user_id or not group_id or not text:
                 return None
             group_name = _first_str(data, "group_name", "chat_name") or f"group:{group_id}"
             return _inbound(
@@ -257,6 +254,7 @@ class Chat43Adapter(BasePlatformAdapter):
                 text=text,
                 conversation_label=group_name,
                 is_from_owner=self._is_from_owner(data, user_id),
+                is_agent=data.get("is_agent") is True,
                 group_subject=group_name,
             )
 
@@ -368,18 +366,11 @@ class Chat43Adapter(BasePlatformAdapter):
 
         return None
 
-    def _is_self_message(self, user_id: str) -> bool:
-        return (
-            not self.settings.allow_self_messages
-            and self.settings.agent_user_id is not None
-            and str(user_id) == str(self.settings.agent_user_id)
-        )
-
     def _is_from_owner(self, data: dict[str, Any], user_id: str) -> bool:
         explicit = data.get("is_from_owner")
         if isinstance(explicit, bool):
             return explicit
-        return self.settings.owner_user_id is not None and str(user_id) == str(self.settings.owner_user_id)
+        return False
 
 
 def check_requirements() -> bool:
@@ -601,7 +592,8 @@ def _format_cli_inbox_line(event: MessageEvent) -> str:
         sender = str(raw_message.get("sender_name") or raw_message.get("sender_id") or "43Chat")
         chat_id = str(raw_message.get("chat_id") or "")
         text = _truncate_single_line(str(raw_message.get("text") or getattr(event, "text", "")), 500)
-        return f"[43Chat] {sender} @ {chat_id}: {text}"
+        agent_note = " [来自 Agent]" if raw_message.get("is_agent") is True else ""
+        return f"[43Chat] {sender}{agent_note} @ {chat_id}: {text}"
     source = getattr(event, "source", None)
     sender = str(getattr(source, "user_name", None) or getattr(source, "user_id", None) or "43Chat")
     chat_id = str(getattr(source, "chat_id", None) or "")
@@ -772,6 +764,7 @@ def _inbound(
     text: str,
     conversation_label: str,
     is_from_owner: bool,
+    is_agent: bool = False,
     group_subject: str | None = None,
     message_id: str | None = None,
 ) -> dict[str, Any]:
@@ -787,6 +780,7 @@ def _inbound(
         "conversation_label": conversation_label,
         "group_subject": group_subject,
         "is_from_owner": is_from_owner,
+        "is_agent": is_agent,
         "timestamp": _event_timestamp(data, raw_event),
     }
 
@@ -833,7 +827,11 @@ def format_main_session_notification(inbound: dict[str, Any]) -> str:
     sender_id = str(inbound.get("sender_id") or "")
     sender_name = str(inbound.get("sender_name") or sender_id or "43Chat")
     header = f"🔔来自43Chat的{chat_label}消息 {subject}" if chat_type == "group" else f"🔔来自43Chat的{chat_label}消息"
-    return f"{header}\n{sender_name} ({sender_id}) : {preview}"
+    parts = [header]
+    if inbound.get("is_agent") is True:
+        parts.append("说明: 该消息来自 Agent")
+    parts.append(f"{sender_name} ({sender_id}) : {preview}")
+    return "\n".join(parts)
 
 
 def _truncate_single_line(value: str, max_length: int) -> str:
@@ -998,14 +996,3 @@ def _resolve_env_ref(value: Any) -> str | None:
     if text.startswith("${") and text.endswith("}"):
         return os.getenv(text[2:-1])
     return text
-
-
-def _bool_env(env_name: str, config_value: Any, default: bool) -> bool:
-    value = os.getenv(env_name)
-    if value is None:
-        value = config_value
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    return str(value).lower() in {"1", "true", "yes", "on"}

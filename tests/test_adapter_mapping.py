@@ -17,7 +17,7 @@ spec.loader.exec_module(adapter_mod)
 
 
 class Config:
-    extra = {"api_key": "sk-test", "agent_user_id": "999"}
+    extra = {"api_key": "sk-test", "user_id": "999"}
 
 
 def test_owner_private_message_dispatches_as_human_input():
@@ -163,6 +163,48 @@ def test_non_owner_private_message_becomes_notification(monkeypatch, tmp_path):
     assert inbox.exists()
 
 
+def test_agent_private_message_adds_agent_note():
+    adapter = adapter_mod.Chat43Adapter(Config())
+    event = adapter.build_message_event(
+        {
+            "id": "evt-agent",
+            "event_type": "private_message",
+            "data": {
+                "message_id": "msg-agent",
+                "from_user_id": 12461,
+                "from_nickname": "alice",
+                "content": "handled by agent",
+                "is_agent": True,
+            },
+        }
+    )
+
+    assert event is not None
+    assert event.text == "🔔来自43Chat的私聊消息\n说明: 该消息来自 Agent\nalice (12461) : handled by agent"
+    assert event.raw_message["is_agent"] is True
+
+
+def test_non_agent_private_message_false_does_not_add_agent_note():
+    adapter = adapter_mod.Chat43Adapter(Config())
+    event = adapter.build_message_event(
+        {
+            "id": "evt-human",
+            "event_type": "private_message",
+            "data": {
+                "message_id": "msg-human",
+                "from_user_id": 12461,
+                "from_nickname": "alice",
+                "content": "from human",
+                "is_agent": False,
+            },
+        }
+    )
+
+    assert event is not None
+    assert event.text == "🔔来自43Chat的私聊消息\nalice (12461) : from human"
+    assert event.raw_message["is_agent"] is False
+
+
 def test_group_message_becomes_notification():
     adapter = adapter_mod.Chat43Adapter(Config())
     event = adapter.build_message_event(
@@ -250,7 +292,7 @@ def test_system_notice_becomes_notification():
     assert event.source.chat_id == "private:system"
 
 
-def test_self_message_is_filtered():
+def test_same_user_id_without_owner_flag_becomes_notification():
     adapter = adapter_mod.Chat43Adapter(Config())
     event = adapter.build_message_event(
         {
@@ -259,7 +301,85 @@ def test_self_message_is_filtered():
         }
     )
 
-    assert event is None
+    assert event is not None
+    assert event.text == "🔔来自43Chat的私聊消息\n999 (999) : loop"
+
+
+def test_owner_message_from_same_user_id_is_not_filtered():
+    adapter = adapter_mod.Chat43Adapter(Config())
+    event = adapter.build_message_event(
+        {
+            "event_type": "private_message",
+            "data": {
+                "message_id": "msg-owner-self",
+                "from_user_id": 999,
+                "from_nickname": "owner",
+                "content": "mind transfer",
+                "is_from_owner": True,
+            },
+        }
+    )
+
+    assert event is not None
+    assert event.text == "mind transfer"
+    assert event.source.chat_id == "private:999"
+
+
+def test_agent_message_from_same_user_id_without_owner_flag_becomes_notification():
+    adapter = adapter_mod.Chat43Adapter(Config())
+    event = adapter.build_message_event(
+        {
+            "event_type": "private_message",
+            "data": {
+                "message_id": "msg-agent-self",
+                "from_user_id": 999,
+                "content": "agent loop",
+                "is_agent": True,
+            },
+        }
+    )
+
+    assert event is not None
+    assert event.text == "🔔来自43Chat的私聊消息\n说明: 该消息来自 Agent\n999 (999) : agent loop"
+
+
+def test_owner_agent_private_message_display_line_adds_agent_note(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    marker = tmp_path / "active_cli_session.json"
+    marker.write_text(
+        '{"session_id": "cli-session-1", "pid": null, "updated_at": 4102444800}',
+        encoding="utf-8",
+    )
+
+    class FakeEntry:
+        session_key = "agent:main:43chat:dm:private:999"
+
+    class FakeSessionStore:
+        def get_or_create_session(self, source):
+            return FakeEntry()
+
+        def switch_session(self, session_key, session_id):
+            return FakeEntry()
+
+    adapter = adapter_mod.Chat43Adapter(Config())
+    event = adapter.build_message_event(
+        {
+            "event_type": "private_message",
+            "data": {
+                "message_id": "msg-owner-agent",
+                "from_user_id": 999,
+                "from_nickname": "owner",
+                "content": "agent report",
+                "is_from_owner": True,
+                "is_agent": True,
+            },
+        }
+    )
+
+    assert event is not None
+    adapter_mod._route_43chat_notification(event, object(), session_store=FakeSessionStore())
+    inbox_text = (tmp_path / "cli_inbox" / "43chat.jsonl").read_text(encoding="utf-8")
+    assert "[43Chat] owner [来自 Agent] @ private:999: agent report" in inbox_text
 
 
 def test_cli_pre_llm_hook_displays_and_drains_notification_inbox(monkeypatch, tmp_path, capsys):

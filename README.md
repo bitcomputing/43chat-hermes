@@ -43,17 +43,14 @@ gateway:
       extra:
         api_key: "sk-..."
         base_url: "https://43chat.cn"
-        agent_user_id: "12445"
-        owner_user_id: "12445"
-        allow_self_messages: false
+        user_id: "12445"
 ```
 
 Or use environment variables:
 
 ```bash
 export CHAT43_API_KEY=sk-...
-export CHAT43_AGENT_USER_ID=12445
-export CHAT43_OWNER_USER_ID=12445
+export CHAT43_USER_ID=12445
 export CHAT43_ALLOW_ALL_USERS=false
 export CHAT43_ALLOWED_USERS=12445,12461
 ```
