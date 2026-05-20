@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 import sys
 import asyncio
+import queue
 
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1] / "plugins" / "platforms" / "43chat"
@@ -20,7 +21,8 @@ class Config:
     extra = {"api_key": "sk-test", "user_id": "999"}
 
 
-def test_owner_private_message_dispatches_as_human_input():
+def test_owner_private_message_queues_cli_notification(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     adapter = adapter_mod.Chat43Adapter(Config())
     event = adapter.build_message_event(
         {
@@ -42,7 +44,14 @@ def test_owner_private_message_dispatches_as_human_input():
     assert event.source.chat_id == "private:12461"
     assert event.source.chat_type == "dm"
     assert event.source.user_id == "12461"
-    assert adapter_mod._route_43chat_notification(event, object()) is None
+    assert adapter_mod._route_43chat_notification(event, object()) == {
+        "action": "skip",
+        "reason": "queued_43chat_owner_prompt",
+    }
+    inbox = tmp_path / "cli_inbox" / "43chat.jsonl"
+    assert inbox.exists()
+    assert "[43Chat] owner @ private:12461: do it" in inbox.read_text(encoding="utf-8")
+    assert '"owner_prompt": "do it"' in inbox.read_text(encoding="utf-8")
 
 
 def test_owner_private_message_routes_to_active_cli_session(monkeypatch, tmp_path):
@@ -85,13 +94,16 @@ def test_owner_private_message_routes_to_active_cli_session(monkeypatch, tmp_pat
 
     store = FakeSessionStore()
     assert event is not None
-    assert adapter_mod._route_43chat_notification(event, object(), session_store=store) is None
-    assert store.switched == [("agent:main:43chat:dm:private:12461", "cli-session-1")]
+    assert adapter_mod._route_43chat_notification(event, object(), session_store=store) == {
+        "action": "skip",
+        "reason": "queued_43chat_owner_prompt",
+    }
+    assert store.switched == []
     inbox = tmp_path / "cli_inbox" / "43chat.jsonl"
     assert inbox.exists()
     inbox_text = inbox.read_text(encoding="utf-8")
-    assert '"display_only": true' in inbox_text
     assert "[43Chat] owner @ private:12461: do it" in inbox_text
+    assert '"owner_prompt": "do it"' in inbox_text
 
 
 def test_cli_pre_llm_hook_prints_display_only_without_context(monkeypatch, tmp_path, capsys):
@@ -379,7 +391,39 @@ def test_owner_agent_private_message_display_line_adds_agent_note(monkeypatch, t
     assert event is not None
     adapter_mod._route_43chat_notification(event, object(), session_store=FakeSessionStore())
     inbox_text = (tmp_path / "cli_inbox" / "43chat.jsonl").read_text(encoding="utf-8")
-    assert "[43Chat] owner [来自 Agent] @ private:999: agent report" in inbox_text
+    assert event.text == "🔔来自43Chat的私聊消息\n说明: 该消息来自 Agent\nowner (999) : agent report"
+    assert "agent report" in inbox_text
+    assert '"owner_prompt"' not in inbox_text
+
+
+def test_duplicate_43chat_message_is_skipped(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = adapter_mod.Chat43Adapter(Config())
+    event = adapter.build_message_event(
+        {
+            "event_type": "private_message",
+            "data": {
+                "message_id": "msg-dup",
+                "from_user_id": 12461,
+                "from_nickname": "owner",
+                "content": "do it once",
+                "is_from_owner": True,
+            },
+        }
+    )
+
+    assert event is not None
+    assert adapter_mod._route_43chat_notification(event, object()) == {
+        "action": "skip",
+        "reason": "queued_43chat_owner_prompt",
+    }
+    assert adapter_mod._route_43chat_notification(event, object()) == {
+        "action": "skip",
+        "reason": "duplicate_43chat_event",
+    }
+    inbox_lines = (tmp_path / "cli_inbox" / "43chat.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(inbox_lines) == 1
+    assert "do it once" in inbox_lines[0]
 
 
 def test_cli_pre_llm_hook_displays_and_drains_notification_inbox(monkeypatch, tmp_path, capsys):
@@ -396,6 +440,9 @@ def test_cli_pre_llm_hook_displays_and_drains_notification_inbox(monkeypatch, tm
         "hello from 43chat"}
     assert "hello from 43chat" in capsys.readouterr().out
     assert not inbox.exists()
+    marker = tmp_path / "active_cli_session.json"
+    assert marker.exists()
+    assert '"session_id": "session-1"' in marker.read_text(encoding="utf-8")
 
 
 def test_cli_pre_llm_hook_does_not_duplicate_already_appended_notification(monkeypatch, tmp_path, capsys):
@@ -546,6 +593,194 @@ def test_cli_pre_llm_hook_ignores_gateway_platforms(monkeypatch, tmp_path):
     assert inbox.exists()
 
 
+def test_cli_session_hooks_mark_and_clear_active_session(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    adapter_mod._mark_active_cli_session(platform="cli", session_id="session-1")
+
+    marker = tmp_path / "active_cli_session.json"
+    assert marker.exists()
+    assert adapter_mod._active_cli_session_id() == "session-1"
+
+    adapter_mod._clear_active_cli_session(platform="cli", session_id="other-session")
+    assert marker.exists()
+
+    adapter_mod._clear_active_cli_session(platform="cli", session_id="session-1")
+    assert not marker.exists()
+
+
+def test_cli_marker_thread_refreshes_when_cli_ref_exists(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    calls: list[dict] = []
+    sleeps: list[float] = []
+
+    class FakeThread:
+        def __init__(self, target, name=None, daemon=None):
+            self.target = target
+            self.name = name
+            self.daemon = daemon
+
+        def start(self):
+            self.target()
+
+    class FakeCli:
+        session_id = "session-thread"
+
+    class FakeManager:
+        _cli_ref = FakeCli()
+
+    class FakeCtx:
+        _manager = FakeManager()
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        raise RuntimeError("stop loop")
+
+    monkeypatch.setattr(adapter_mod, "_CLI_MARKER_THREAD_STARTED", False)
+    monkeypatch.setattr(adapter_mod.threading, "Thread", FakeThread)
+    monkeypatch.setattr(adapter_mod.time, "sleep", fake_sleep)
+    monkeypatch.setattr(adapter_mod, "_mark_active_cli_session", lambda **kwargs: calls.append(kwargs))
+
+    adapter_mod._start_cli_marker_thread(FakeCtx())
+
+    assert calls == [{"platform": "cli", "session_id": "session-thread"}]
+    assert sleeps == [5.0]
+
+
+def test_deliver_cli_inbox_to_active_cli_appends_and_prints(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    inbox = tmp_path / "cli_inbox" / "43chat.jsonl"
+    inbox.parent.mkdir(parents=True)
+    inbox.write_text('{"text": "[43Chat] hello"}\n', encoding="utf-8")
+    appended: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        adapter_mod,
+        "_append_cli_assistant_notification",
+        lambda session_id, text: appended.append((session_id, text)) or True,
+    )
+
+    adapter_mod._deliver_cli_inbox_to_active_cli("session-1")
+
+    assert appended == [("session-1", "[43Chat] hello")]
+    assert "[43Chat] hello" in capsys.readouterr().out
+    assert not inbox.exists()
+
+
+def test_deliver_owner_prompt_injects_pending_cli_input(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    inbox = tmp_path / "cli_inbox" / "43chat.jsonl"
+    inbox.parent.mkdir(parents=True)
+    inbox.write_text(
+        '{"text": "[43Chat] owner @ private:123: do it", "owner_prompt": "do it"}\n',
+        encoding="utf-8",
+    )
+
+    class FakeCli:
+        _agent_running = False
+
+        def __init__(self):
+            self._pending_input = queue.Queue()
+            self._interrupt_queue = queue.Queue()
+            self.invalidated = False
+
+        def _invalidate(self, min_interval=0.25):
+            self.invalidated = True
+
+    appended: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        adapter_mod,
+        "_append_cli_assistant_notification",
+        lambda session_id, text: appended.append((session_id, text)) or True,
+    )
+
+    cli_ref = FakeCli()
+    adapter_mod._deliver_cli_inbox_to_active_cli("session-1", cli_ref=cli_ref)
+
+    assert cli_ref._pending_input.get_nowait() == "do it"
+    assert cli_ref._interrupt_queue.empty()
+    assert cli_ref.invalidated is True
+    assert appended == []
+    assert "[43Chat] owner @ private:123: do it" in capsys.readouterr().out
+    assert not inbox.exists()
+
+
+def test_deliver_owner_prompt_records_43chat_reply_target(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    inbox = tmp_path / "cli_inbox" / "43chat.jsonl"
+    inbox.parent.mkdir(parents=True)
+    inbox.write_text(
+        json_line(
+            {
+                "text": "[43Chat] owner @ private:123: do it",
+                "message_id": "msg-1",
+                "owner_prompt": "do it",
+                "inbound": {"chat_id": "private:123"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeCli:
+        _agent_running = False
+
+        def __init__(self):
+            self._pending_input = queue.Queue()
+
+    cli_ref = FakeCli()
+    adapter_mod._deliver_cli_inbox_to_active_cli("session-1", cli_ref=cli_ref)
+
+    assert cli_ref._pending_input.get_nowait() == "do it"
+    pending = tmp_path / "cli_inbox" / "43chat_reply_targets.json"
+    payload = pending.read_text(encoding="utf-8")
+    assert '"session_id": "session-1"' in payload
+    assert '"prompt": "do it"' in payload
+    assert '"chat_id": "private:123"' in payload
+
+
+def test_post_llm_hook_sends_owner_reply_to_43chat(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("CHAT43_API_KEY", "sk-test")
+    monkeypatch.setenv("CHAT43_BASE_URL", "https://example.test")
+    monkeypatch.setattr(adapter_mod, "_active_cli_session_id", lambda: "session-1")
+    adapter_mod._append_pending_43chat_reply(
+        "session-1",
+        "do it",
+        {"message_id": "msg-1", "chat_id": "private:123"},
+    )
+    sends: list[tuple[str, str, str]] = []
+
+    class FakeClient:
+        def __init__(self, config):
+            assert config.api_key == "sk-test"
+            assert config.base_url == "https://example.test"
+
+        async def send_private_message(self, user_id, content):
+            sends.append(("private", user_id, content))
+            return "sent-1"
+
+        async def send_group_message(self, group_id, content):
+            sends.append(("group", group_id, content))
+            return "sent-group"
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(adapter_mod, "Chat43APIClient", FakeClient)
+
+    adapter_mod._send_43chat_reply_after_cli_turn(
+        platform="cli",
+        session_id="session-1",
+        user_message="do it",
+        assistant_response="done",
+    )
+
+    assert sends == [("private", "123", "done")]
+    pending = tmp_path / "cli_inbox" / "43chat_reply_targets.json"
+    assert pending.read_text(encoding="utf-8") == "[]"
+    inbox_text = (tmp_path / "cli_inbox" / "43chat.jsonl").read_text(encoding="utf-8")
+    assert "[Hermes -> 43Chat] @ private:123: done" in inbox_text
+
+
 def test_message_content_extracts_wrapped_json_text():
     adapter = adapter_mod.Chat43Adapter(Config())
     event = adapter.build_message_event(
@@ -562,3 +797,9 @@ def test_message_content_extracts_wrapped_json_text():
 
     assert event is not None
     assert event.text == "你好啊"
+
+
+def json_line(payload):
+    import json
+
+    return json.dumps(payload, ensure_ascii=False) + "\n"

@@ -4,6 +4,8 @@ import logging
 import os
 import json
 import time
+import threading
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +19,7 @@ except ImportError:  # pragma: no cover - direct-file test loading
     from chat43_sse import Chat43SSEClient, Chat43SSEConfig
 
 logger = logging.getLogger(__name__)
+_CLI_MARKER_THREAD_STARTED = False
 
 try:
     from gateway.config import Platform, PlatformConfig
@@ -76,7 +79,11 @@ except Exception:  # pragma: no cover - lets this repo unit-test mapping without
             self.connected = False
 
 
-CHAT43_PLATFORM = Platform("43chat")
+CHAT43_PLATFORM_NAME = "43chat"
+
+
+def _chat43_platform() -> Platform:
+    return Platform(CHAT43_PLATFORM_NAME)
 
 
 @dataclass(frozen=True)
@@ -109,7 +116,7 @@ class Chat43AdapterSettings:
 
 class Chat43Adapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
-        super().__init__(config, CHAT43_PLATFORM)
+        super().__init__(config, _chat43_platform())
         self.settings = Chat43AdapterSettings.from_platform_config(config)
         self.api = Chat43APIClient(
             Chat43APIConfig(
@@ -200,7 +207,7 @@ class Chat43Adapter(BasePlatformAdapter):
             user_name=inbound["sender_name"],
             message_id=inbound["message_id"],
         )
-        dispatch_to_agent = inbound["chat_type"] == "direct" and inbound["is_from_owner"]
+        dispatch_to_agent = inbound["chat_type"] == "direct" and inbound["is_from_owner"] and not inbound["is_agent"]
         return MessageEvent(
             text=inbound["text"] if dispatch_to_agent else format_main_session_notification(inbound),
             message_type=MessageType.TEXT,
@@ -386,10 +393,52 @@ def validate_config(config: PlatformConfig) -> bool:
     return bool(os.getenv("CHAT43_API_KEY") or _resolve_env_ref(extra.get("api_key")))
 
 
+def _env_enablement() -> dict[str, Any] | None:
+    api_key = os.getenv("CHAT43_API_KEY", "").strip()
+    if not api_key:
+        return None
+    seed: dict[str, Any] = {"api_key": api_key}
+    for env_name, extra_name in (
+        ("CHAT43_BASE_URL", "base_url"),
+        ("CHAT43_AGENT_ID", "agent_id"),
+        ("CHAT43_USER_ID", "user_id"),
+        ("CHAT43_REQUEST_TIMEOUT_S", "request_timeout_s"),
+        ("CHAT43_RECONNECT_INITIAL_S", "reconnect_initial_s"),
+        ("CHAT43_RECONNECT_MAX_S", "reconnect_max_s"),
+    ):
+        value = os.getenv(env_name)
+        if value:
+            seed[extra_name] = value
+    return seed
+
+
+def _apply_yaml_config(yaml_cfg: dict[str, Any], platform_cfg: dict[str, Any]) -> dict[str, Any] | None:
+    seed: dict[str, Any] = {}
+    extra = platform_cfg.get("extra")
+    if isinstance(extra, dict):
+        seed.update(extra)
+    for key in (
+        "api_key",
+        "base_url",
+        "agent_id",
+        "user_id",
+        "request_timeout_s",
+        "reconnect_initial_s",
+        "reconnect_max_s",
+    ):
+        if key in platform_cfg:
+            seed[key] = platform_cfg[key]
+    return seed or None
+
+
 def register(ctx: Any) -> None:
+    _start_cli_marker_thread(ctx)
     if hasattr(ctx, "register_hook"):
         ctx.register_hook("pre_gateway_dispatch", _route_43chat_notification)
+        ctx.register_hook("on_session_start", _mark_active_cli_session)
         ctx.register_hook("pre_llm_call", _inject_cli_notifications)
+        ctx.register_hook("post_llm_call", _send_43chat_reply_after_cli_turn)
+        ctx.register_hook("on_session_finalize", _clear_active_cli_session)
 
     ctx.register_platform(
         name="43chat",
@@ -399,6 +448,8 @@ def register(ctx: Any) -> None:
         validate_config=validate_config,
         required_env=["CHAT43_API_KEY"],
         install_hint="pip install aiohttp",
+        env_enablement_fn=_env_enablement,
+        apply_yaml_config_fn=_apply_yaml_config,
         allowed_users_env="CHAT43_ALLOWED_USERS",
         allow_all_env="CHAT43_ALLOW_ALL_USERS",
         max_message_length=0,
@@ -411,18 +462,25 @@ def _route_43chat_notification(event: MessageEvent, gateway: Any, session_store:
     source = getattr(event, "source", None)
     if source is None or _platform_value(getattr(source, "platform", None)) != "43chat":
         return None
-    if _is_owner_direct_event(event):
-        _route_owner_direct_to_active_cli_session(event, session_store)
-        return None
-    if not _is_notification_event(event):
-        return None
+    if _seen_43chat_event(event):
+        return {"action": "skip", "reason": "duplicate_43chat_event"}
 
-    appended_session_id = _append_active_cli_assistant_notification(event.text)
+    notification_text = event.text if _is_notification_event(event) else _format_cli_inbox_line(event)
+    if _is_owner_direct_event(event):
+        _append_cli_inbox(
+            notification_text,
+            event,
+            owner_prompt=str(getattr(event, "text", "") or "").strip(),
+        )
+        logger.info("Queued 43Chat owner DM for active CLI prompt")
+        return {"action": "skip", "reason": "queued_43chat_owner_prompt"}
+
+    appended_session_id = _append_active_cli_assistant_notification(notification_text)
     if appended_session_id:
-        _append_cli_inbox(event.text, event, appended_session_id=appended_session_id)
+        _append_cli_inbox(notification_text, event, appended_session_id=appended_session_id)
         logger.info("Appended 43Chat notification to active CLI session")
     else:
-        _append_cli_inbox(event.text, event)
+        _append_cli_inbox(notification_text, event)
         logger.info("Queued 43Chat notification for CLI inbox")
     return {"action": "skip", "reason": "queued_43chat_notification"}
 
@@ -454,6 +512,7 @@ def _inject_cli_notifications(**kwargs: Any) -> dict[str, str] | None:
     if platform not in ("cli", "local"):
         return None
     session_id = str(kwargs.get("session_id") or "")
+    _mark_active_cli_session(**kwargs)
     conversation_history = kwargs.get("conversation_history")
     existing_messages = _conversation_texts(conversation_history)
     records = _drain_cli_inbox_records()
@@ -553,7 +612,7 @@ def _is_owner_direct_event(event: MessageEvent) -> bool:
     raw_message = getattr(event, "raw_message", None)
     if not isinstance(raw_message, dict):
         return False
-    return raw_message.get("chat_type") == "direct" and raw_message.get("is_from_owner") is True
+    return raw_message.get("chat_type") == "direct" and raw_message.get("is_from_owner") is True and raw_message.get("is_agent") is not True
 
 
 def _is_43chat_notification_text(text: str) -> bool:
@@ -567,6 +626,7 @@ def _append_cli_inbox(
     *,
     appended_session_id: str | None = None,
     display_only: bool = False,
+    owner_prompt: str | None = None,
 ) -> None:
     inbox = _cli_inbox_path()
     inbox.parent.mkdir(parents=True, exist_ok=True)
@@ -582,6 +642,8 @@ def _append_cli_inbox(
         record["appended_session_id"] = appended_session_id
     if display_only:
         record["display_only"] = True
+    if owner_prompt:
+        record["owner_prompt"] = owner_prompt
     with inbox.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -611,7 +673,7 @@ def _append_cli_send_display(chat_id: str, content: str, message_id: str | None 
         text=display,
         message_type=MessageType.TEXT,
         source=SessionSource(
-            platform=CHAT43_PLATFORM,
+            platform=_chat43_platform(),
             chat_id=chat_id,
             chat_name=chat_id,
             chat_type="dm" if chat_id.startswith("private:") else "group",
@@ -713,7 +775,345 @@ def _active_cli_session_path() -> Path:
     return Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes") / "active_cli_session.json"
 
 
-def _active_cli_session_id(max_age_s: float = 300.0) -> str | None:
+def _seen_43chat_event(event: MessageEvent, ttl_s: float = 3600.0) -> bool:
+    key = _43chat_event_key(event)
+    if not key:
+        return False
+    path = _seen_43chat_events_path()
+    now = time.time()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    compacted: dict[str, float] = {}
+    for item_key, item_time in payload.items():
+        try:
+            seen_at = float(item_time)
+        except (TypeError, ValueError):
+            continue
+        if now - seen_at <= ttl_s:
+            compacted[str(item_key)] = seen_at
+
+    duplicate = key in compacted
+    compacted[key] = now
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(compacted, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        logger.debug("Could not write 43Chat event dedupe file", exc_info=True)
+    return duplicate
+
+
+def _43chat_event_key(event: MessageEvent) -> str | None:
+    raw_message = getattr(event, "raw_message", None)
+    source = getattr(event, "source", None)
+    chat_id = str(getattr(source, "chat_id", "") or "")
+    message_id = str(getattr(event, "message_id", "") or "")
+    if not message_id and isinstance(raw_message, dict):
+        message_id = str(raw_message.get("message_id") or "")
+    if message_id:
+        return f"{chat_id}:{message_id}"
+    if not isinstance(raw_message, dict):
+        return None
+    event_type = str(raw_message.get("event_type") or "")
+    sender_id = str(raw_message.get("sender_id") or "")
+    text = str(raw_message.get("text") or "")
+    timestamp = str(raw_message.get("timestamp") or "")
+    if not chat_id or not text:
+        return None
+    return f"{event_type}:{chat_id}:{sender_id}:{timestamp}:{text}"
+
+
+def _seen_43chat_events_path() -> Path:
+    return Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes") / "cli_inbox" / "43chat_seen_events.json"
+
+
+def _start_cli_marker_thread(ctx: Any) -> None:
+    global _CLI_MARKER_THREAD_STARTED
+    if _CLI_MARKER_THREAD_STARTED:
+        return
+    _CLI_MARKER_THREAD_STARTED = True
+
+    def _loop() -> None:
+        while True:
+            try:
+                manager = getattr(ctx, "_manager", None)
+                cli_ref = getattr(manager, "_cli_ref", None)
+                if cli_ref is not None:
+                    session_id = str(getattr(cli_ref, "session_id", "") or "")
+                    if session_id:
+                        _mark_active_cli_session(platform="cli", session_id=session_id)
+                        _deliver_cli_inbox_to_active_cli(session_id, cli_ref=cli_ref)
+            except Exception:
+                logger.debug("Could not refresh active 43Chat CLI session marker", exc_info=True)
+            time.sleep(5.0)
+
+    try:
+        thread = threading.Thread(target=_loop, name="43chat-cli-marker", daemon=True)
+        thread.start()
+    except Exception:
+        logger.debug("Could not start active 43Chat CLI session marker thread", exc_info=True)
+
+
+def _deliver_cli_inbox_to_active_cli(session_id: str, cli_ref: Any = None) -> None:
+    if not session_id:
+        return
+    records = _drain_cli_inbox_records()
+    if not records:
+        return
+    try:
+        from cli import _cprint as _cli_cprint
+    except Exception:
+        _cli_cprint = None
+
+    for record in records:
+        text = record.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        msg = text.strip()
+        owner_prompt = record.get("owner_prompt")
+        if isinstance(owner_prompt, str) and owner_prompt.strip() and cli_ref is not None:
+            queue = getattr(cli_ref, "_interrupt_queue", None) if getattr(cli_ref, "_agent_running", False) else getattr(cli_ref, "_pending_input", None)
+            if queue is not None:
+                queue.put(owner_prompt.strip())
+                _append_pending_43chat_reply(session_id, owner_prompt.strip(), record)
+            invalidate = getattr(cli_ref, "_invalidate", None)
+            if callable(invalidate):
+                invalidate(min_interval=0.0)
+            if _cli_cprint:
+                _cli_cprint(msg)
+            else:
+                print(msg, flush=True)
+            continue
+        if not record.get("display_only") and record.get("appended_session_id") != session_id:
+            _append_cli_assistant_notification(session_id, msg)
+        if _cli_cprint:
+            _cli_cprint(msg)
+        else:
+            print(msg, flush=True)
+
+
+def _send_43chat_reply_after_cli_turn(**kwargs: Any) -> None:
+    platform = str(kwargs.get("platform") or "").lower()
+    if platform not in ("", "cli", "local"):
+        return
+    session_id = str(kwargs.get("session_id") or "")
+    user_message = str(kwargs.get("user_message") or "").strip()
+    assistant_response = str(kwargs.get("assistant_response") or "").strip()
+    if not session_id or not user_message or not assistant_response:
+        return
+    if assistant_response == "NO_REPLY":
+        return
+
+    target = _pop_pending_43chat_reply(session_id, user_message)
+    if not target:
+        return
+    chat_id = str(target.get("chat_id") or "")
+    if not chat_id:
+        return
+
+    try:
+        message_id = _run_async_blocking(_send_43chat_reply(chat_id, assistant_response))
+        _append_cli_send_display(chat_id, assistant_response, message_id)
+        logger.info("Sent CLI assistant reply back to 43Chat %s", chat_id)
+    except Exception:
+        logger.exception("Failed to send CLI assistant reply back to 43Chat %s", chat_id)
+        _append_pending_43chat_reply(session_id, user_message, target)
+
+
+async def _send_43chat_reply(chat_id: str, content: str) -> str | None:
+    cfg = _load_43chat_api_config()
+    client = Chat43APIClient(cfg)
+    try:
+        if chat_id.startswith("private:"):
+            return await client.send_private_message(chat_id.removeprefix("private:"), content)
+        if chat_id.startswith("group:"):
+            return await client.send_group_message(chat_id.removeprefix("group:"), content)
+        raise ValueError(f"Unsupported 43Chat chat_id: {chat_id}")
+    finally:
+        await client.close()
+
+
+def _run_async_blocking(coro: Any) -> Any:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    result: dict[str, Any] = {}
+
+    def _runner() -> None:
+        try:
+            result["value"] = asyncio.run(coro)
+        except BaseException as exc:  # pragma: no cover - re-raised in caller
+            result["error"] = exc
+
+    thread = threading.Thread(target=_runner, name="43chat-reply-send", daemon=True)
+    thread.start()
+    thread.join()
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
+
+def _append_pending_43chat_reply(session_id: str, prompt: str, record: dict[str, Any]) -> None:
+    if not session_id or not prompt:
+        return
+    inbound = record.get("inbound") if isinstance(record, dict) else None
+    chat_id = ""
+    if isinstance(inbound, dict):
+        chat_id = str(inbound.get("chat_id") or "")
+    if not chat_id and isinstance(record, dict):
+        chat_id = str(record.get("chat_id") or "")
+    if not chat_id:
+        return
+
+    pending = _load_pending_43chat_replies()
+    pending.append(
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "session_id": session_id,
+            "prompt": prompt,
+            "chat_id": chat_id,
+            "message_id": record.get("message_id") if isinstance(record, dict) else None,
+        }
+    )
+    _write_pending_43chat_replies(pending[-50:])
+
+
+def _pop_pending_43chat_reply(session_id: str, prompt: str) -> dict[str, Any] | None:
+    pending = _load_pending_43chat_replies()
+    matched: dict[str, Any] | None = None
+    remaining: list[dict[str, Any]] = []
+    for item in pending:
+        if (
+            matched is None
+            and str(item.get("session_id") or "") == session_id
+            and str(item.get("prompt") or "").strip() == prompt
+        ):
+            matched = item
+            continue
+        remaining.append(item)
+    if matched is not None:
+        _write_pending_43chat_replies(remaining)
+    return matched
+
+
+def _load_pending_43chat_replies() -> list[dict[str, Any]]:
+    path = _pending_43chat_replies_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [item for item in payload if isinstance(item, dict)]
+
+
+def _write_pending_43chat_replies(items: list[dict[str, Any]]) -> None:
+    path = _pending_43chat_replies_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        logger.debug("Could not write pending 43Chat reply targets", exc_info=True)
+
+
+def _pending_43chat_replies_path() -> Path:
+    return Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes") / "cli_inbox" / "43chat_reply_targets.json"
+
+
+def _load_43chat_api_config() -> Chat43APIConfig:
+    extra = _load_43chat_config_extra()
+    api_key = _resolve_env_ref(extra.get("api_key")) or os.getenv("CHAT43_API_KEY") or ""
+    if not api_key:
+        raise ValueError("CHAT43_API_KEY or 43chat.api_key in Hermes config is required")
+    base_url = os.getenv("CHAT43_BASE_URL") or str(_resolve_env_ref(extra.get("base_url")) or "https://43chat.cn")
+    timeout = float(os.getenv("CHAT43_REQUEST_TIMEOUT_S") or extra.get("request_timeout_s") or 30)
+    return Chat43APIConfig(api_key=api_key, base_url=base_url, request_timeout_s=timeout)
+
+
+def _load_43chat_config_extra() -> dict[str, Any]:
+    config_path = Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes") / "config.yaml"
+    try:
+        import yaml  # type: ignore
+
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    candidates: list[Any] = []
+    platforms = payload.get("platforms")
+    if isinstance(platforms, dict):
+        candidates.append(platforms.get("43chat"))
+    gateway = payload.get("gateway")
+    if isinstance(gateway, dict):
+        gateway_platforms = gateway.get("platforms")
+        if isinstance(gateway_platforms, dict):
+            candidates.append(gateway_platforms.get("43chat"))
+    candidates.append(payload.get("43chat"))
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        merged: dict[str, Any] = {}
+        extra = candidate.get("extra")
+        if isinstance(extra, dict):
+            merged.update(extra)
+        for key in ("api_key", "base_url", "request_timeout_s"):
+            if key in candidate:
+                merged[key] = candidate[key]
+        if merged:
+            return merged
+    return {}
+
+
+def _mark_active_cli_session(**kwargs: Any) -> None:
+    platform = str(kwargs.get("platform") or "").lower()
+    if platform not in ("cli", "local"):
+        return
+    session_id = str(kwargs.get("session_id") or "")
+    if not session_id:
+        return
+    marker = _active_cli_session_path()
+    payload = {
+        "session_id": session_id,
+        "pid": os.getpid(),
+        "updated_at": time.time(),
+    }
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        logger.debug("Could not write active 43Chat CLI session marker", exc_info=True)
+
+
+def _clear_active_cli_session(**kwargs: Any) -> None:
+    platform = str(kwargs.get("platform") or "").lower()
+    if platform not in ("cli", "local"):
+        return
+    session_id = str(kwargs.get("session_id") or "")
+    marker = _active_cli_session_path()
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not isinstance(payload, dict):
+        return
+    if session_id and str(payload.get("session_id") or "") != session_id:
+        return
+    try:
+        marker.unlink()
+    except OSError:
+        pass
+
+
+def _active_cli_session_id(max_age_s: float = 86400.0) -> str | None:
     marker = _active_cli_session_path()
     try:
         payload = json.loads(marker.read_text(encoding="utf-8"))
