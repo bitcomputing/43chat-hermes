@@ -61,7 +61,8 @@ class Chat43APIClient:
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         session = self._get_session()
-        url = self.config.base_url.rstrip("/") + path
+        base_url = self.config.base_url.rstrip("/")
+        url = base_url + path
         timeout = aiohttp.ClientTimeout(total=self.config.request_timeout_s)
         headers = {
             "Authorization": f"Bearer {self.config.api_key}",
@@ -72,6 +73,10 @@ class Chat43APIClient:
 
         async with session.request(method, url, headers=headers, timeout=timeout, **kwargs) as response:
             text = await response.text()
+            if response.status == 405 and method.upper() == "POST" and path.startswith("/open/message/"):
+                fallback_url = _message_send_fallback_url(base_url, path)
+                if fallback_url and fallback_url != url:
+                    return await self._request_url(method, fallback_url, headers, timeout, **kwargs)
             if response.status >= 400:
                 raise Chat43APIError(f"43Chat HTTP {response.status}: {text}", status=response.status)
             try:
@@ -79,18 +84,47 @@ class Chat43APIClient:
             except Exception as exc:
                 raise Chat43APIError(f"43Chat returned non-JSON response: {text}") from exc
 
-        if isinstance(payload, dict) and "code" in payload:
-            code = payload.get("code")
-            if code not in (0, None):
-                message = payload.get("message") or payload.get("msg") or "unknown error"
-                raise Chat43APIError(f"43Chat API error {code}: {message}", code=int(code))
-            return payload.get("data")
-        return payload
+        return _unwrap_payload(payload)
+
+    async def _request_url(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        timeout: "aiohttp.ClientTimeout",
+        **kwargs: Any,
+    ) -> Any:
+        session = self._get_session()
+        async with session.request(method, url, headers=headers, timeout=timeout, **kwargs) as response:
+            text = await response.text()
+            if response.status >= 400:
+                raise Chat43APIError(f"43Chat HTTP {response.status}: {text}", status=response.status)
+            try:
+                payload = await response.json(content_type=None)
+            except Exception as exc:
+                raise Chat43APIError(f"43Chat returned non-JSON response: {text}") from exc
+        return _unwrap_payload(payload)
 
     def _get_session(self) -> "aiohttp.ClientSession":
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
         return self._session
+
+
+def _unwrap_payload(payload: Any) -> Any:
+    if isinstance(payload, dict) and "code" in payload:
+        code = payload.get("code")
+        if code not in (0, None):
+            message = payload.get("message") or payload.get("msg") or "unknown error"
+            raise Chat43APIError(f"43Chat API error {code}: {message}", code=int(code))
+        return payload.get("data")
+    return payload
+
+
+def _message_send_fallback_url(base_url: str, path: str) -> str | None:
+    if base_url == "https://43chat.cn":
+        return None
+    return "https://43chat.cn" + path
 
 
 def _numeric_id(value: str) -> int:
@@ -105,4 +139,3 @@ def _message_id(data: Any) -> str | None:
         if value is not None:
             return str(value)
     return None
-

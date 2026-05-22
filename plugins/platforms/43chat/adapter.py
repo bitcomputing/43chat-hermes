@@ -1257,15 +1257,19 @@ def _message_text(data: dict[str, Any]) -> str | None:
     value = _first(data, "content", "text", "message", "body")
     if value is None:
         return None
-    return _extract_text_content(value, _first_str(data, "content_type", "msg_type", "message_type"))
+    return _extract_text_content(value, _first_str(data, "content_type", "msg_type", "message_type"), data)
 
 
-def _extract_text_content(raw_content: Any, msg_type: str | None = None) -> str:
+def _extract_text_content(
+    raw_content: Any,
+    msg_type: str | None = None,
+    message_data: dict[str, Any] | None = None,
+) -> str:
     raw = str(raw_content).strip()
     if not raw:
         return ""
     normalized_type = _normalize_message_type(msg_type)
-    parsed = _parse_object_content(raw)
+    parsed = _object_content(raw_content) or _parse_object_content(raw)
     if not normalized_type or normalized_type == "text":
         if parsed:
             content = _string_field(parsed, "content")
@@ -1281,8 +1285,7 @@ def _extract_text_content(raw_content: Any, msg_type: str | None = None) -> str:
     if normalized_type == "image":
         return _format_image_content(parsed)
     if normalized_type == "file":
-        url = _string_field(parsed, "url")
-        return f"[文件] {url}" if url else "[文件]"
+        return _format_file_content(parsed, raw, message_data)
     if normalized_type == "sharegroup":
         return _format_share_group_content(parsed)
     if normalized_type == "shareuser":
@@ -1312,6 +1315,10 @@ def _parse_object_content(raw: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _object_content(value: Any) -> dict[str, Any] | None:
+    return value if isinstance(value, dict) else None
+
+
 def _string_field(value: dict[str, Any] | None, key: str) -> str | None:
     field = value.get(key) if value else None
     if isinstance(field, str) and field.strip():
@@ -1330,6 +1337,36 @@ def _format_image_content(parsed: dict[str, Any] | None) -> str:
     height = _number_field(parsed, "height")
     size_text = f"尺寸: {width}x{height}" if width is not None and height is not None else None
     return " ".join(part for part in [f"[图片] {url}" if url else "[图片]", size_text] if part)
+
+
+def _format_file_content(
+    parsed: dict[str, Any] | None,
+    raw: str,
+    message_data: dict[str, Any] | None = None,
+) -> str:
+    name = _first_file_string(parsed, "file_name", "filename", "name", "title", "original_name", "original_filename")
+    if not name:
+        name = _first_file_string(message_data, "file_name", "filename", "name", "title", "original_name", "original_filename")
+    url = _first_file_string(parsed, "url", "file_url", "upload_url", "download_url")
+    if not url:
+        url = _first_file_string(message_data, "url", "file_url", "upload_url", "download_url")
+    if not url and raw.startswith(("http://", "https://")):
+        url = " ".join(raw.split())
+
+    parts = ["[文件]"]
+    if name:
+        parts.append(name)
+    if url:
+        parts.append(f"地址: {url}" if name else url)
+    return " ".join(parts)
+
+
+def _first_file_string(value: dict[str, Any] | None, *keys: str) -> str | None:
+    for key in keys:
+        field = _string_field(value, key)
+        if field:
+            return field
+    return None
 
 
 def _format_share_group_content(parsed: dict[str, Any] | None) -> str:

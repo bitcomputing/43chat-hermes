@@ -799,6 +799,45 @@ def test_message_content_extracts_wrapped_json_text():
     assert event.text == "你好啊"
 
 
+def test_file_message_content_shows_filename_and_url():
+    adapter = adapter_mod.Chat43Adapter(Config())
+    event = adapter.build_message_event(
+        {
+            "event_type": "private_message",
+            "data": {
+                "message_id": "msg-file",
+                "from_user_id": 12461,
+                "msg_type": "file",
+                "content": '{"file_name":"report.pdf","url":"https://oss.example/report.pdf"}',
+                "is_from_owner": True,
+            },
+        }
+    )
+
+    assert event is not None
+    assert event.text == "[文件] report.pdf 地址: https://oss.example/report.pdf"
+
+
+def test_file_message_content_uses_outer_filename_with_plain_url():
+    adapter = adapter_mod.Chat43Adapter(Config())
+    event = adapter.build_message_event(
+        {
+            "event_type": "private_message",
+            "data": {
+                "message_id": "msg-file-plain",
+                "from_user_id": 12461,
+                "msg_type": "file",
+                "content": "https://oss.example/book.pdf",
+                "filename": "book.pdf",
+                "is_from_owner": True,
+            },
+        }
+    )
+
+    assert event is not None
+    assert event.text == "[文件] book.pdf 地址: https://oss.example/book.pdf"
+
+
 def json_line(payload):
     import json
 
